@@ -1,177 +1,246 @@
-# Deployment Guide — Intelligent Medical Assistant (ASR API)
+# MedVision AI — Deployment Guide
 
-تطبيق **FastAPI** بيستقبل ملف صوتي لحوار طبي، يحوّله نص بـ **faster-whisper** (لهجة مصرية)، وبعدين ينظّمه في تقرير طبي JSON عن طريق **Google Gemini**.
+FastAPI service for medical image analysis (X-ray + skin) using Gemini Vision + a hybrid
+RAG (ChromaDB semantic + BM25 lexical) over WHO/CDC guidelines, built-in knowledge, and PDFs.
 
-> الـ entrypoint بتاع التطبيق: `hakim_optimized:app`
-
----
-
-## 1) متطلبات السيرفر (System Requirements)
-
-| البند | المطلوب |
-|------|---------|
-| نظام التشغيل | Linux (Ubuntu 22.04+ يفضّل) أو أي OS بيشغّل Python |
-| Python | **3.11** |
-| المعالج | CPU عادي (مفيش حاجة اسمها GPU مطلوبة — الموديل بيشتغل CPU/int8) |
-| RAM | **2 GB على الأقل** لكل worker (الموديل بيتحمّل في الذاكرة لكل worker) |
-| Disk | ~1.5 GB (الـ dependencies + موديل Whisper ~466 MB) |
-| Internet | مطلوب وقت التثبيت + أول تشغيل (لتحميل الموديل)، ومطلوب دايمًا للاتصال بـ Gemini |
-| System lib | `libgomp1` (مكتبة OpenMP اللي بيحتاجها CTranslate2 على Linux) |
-
-> **مهم:** التطبيق **مش محتاج `torch`** ولا GPU. faster-whisper بيشتغل على CTranslate2.
-> وكمان مش محتاج تثبّت `ffmpeg` منفصل — بيتعامل مع الصوت عن طريق PyAV المدمجة.
+This document is for the DevOps engineer deploying the service. It covers prerequisites,
+configuration, running in production, the reverse-proxy setup, and the important gotchas.
 
 ---
 
-## 2) المتغيّرات البيئية (Environment Variables)
-
-التطبيق بيقرأ ملف `.env` بـ `load_dotenv(override=True)` — يعني قيم `.env` **بتغلب** أي متغيّرات موجودة في النظام.
-انسخ `.env.example` لـ `.env` واملا القيم:
-
-| المتغير | إلزامي؟ | الشرح |
-|---------|---------|-------|
-| `GOOGLE_API_KEY` | ✅ **إلزامي** | مفتاح Gemini. **لازم يكون مفتاح مدفوع (billing-enabled)** في الإنتاج عشان نتجنّب أخطاء `503 high demand` المتكررة بتاعة الـ free tier. |
-| `BACKEND_API_KEY` | ✅ **إلزامي** | السر اللي العملاء لازم يبعتوه في الـ header `X-API-KEY`. حُط قيمة عشوائية طويلة (مش `change-me`). |
-| `WHISPER_MODEL` | اختياري | اسم موديل الـ ASR. الافتراضي: `moeshawky/faster-whisper-small-egyptian-arabic` |
-| `WHISPER_BEAM` | اختياري | `1` = أسرع (افتراضي)، `2` = أدق وأبطأ |
-| `DB_*` | اختياري | مش مستخدمة حاليًا في الـ endpoint. سيبها فاضية. |
-
-> ⚠️ **أمان:** متحطّش `.env` ولا أي مفتاح في الـ git repo. المفتاح القديم اللي اتسرّب قبل كده اتعطّل من جوجل — استخدم مفتاح جديد بس.
-
----
-
-## 3) التثبيت (Installation)
+## 1. TL;DR
 
 ```bash
-# 1. system lib مطلوبة لـ CTranslate2
-sudo apt-get update && sudo apt-get install -y libgomp1
+# 1. Python 3.10+ and system libs
+sudo apt-get install -y python3-venv build-essential
 
-# 2. اعمل virtual environment بـ Python 3.11
-python3.11 -m venv .venv
-source .venv/bin/activate
+# 2. Create venv + install deps
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
 
-# 3. ثبّت الـ dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
+# 3. Configure secrets
+cp .env.example .env        # then edit .env with the real keys
 
-# 4. جهّز ملف البيئة
-cp .env.example .env
-# ... عدّل .env وحُط فيه GOOGLE_API_KEY و BACKEND_API_KEY ...
+# 4. First boot — builds the RAG index (needs internet, ~1–2 min). Run with ONE worker.
+.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 5. Verify
+curl http://localhost:8000/health
 ```
 
-أول تشغيل هيحمّل موديل Whisper (~466 MB) من Hugging Face ويخزّنه في الكاش (`~/.cache/huggingface`). ده بيحصل **مرة واحدة بس**.
+For production, run it under **systemd** or **Docker** (sections 6–7) behind **nginx**
+with a **long read timeout** (section 8 — this is the #1 thing that breaks deployments).
 
 ---
 
-## 4) التشغيل في الإنتاج (Run in Production)
+## 2. What gets deployed
 
-**متستخدمش `--reload` في الإنتاج.** استخدم gunicorn مع uvicorn workers:
+| Path | Commit to git? | Notes |
+|------|----------------|-------|
+| `main.py` | ✅ | The whole app (single file). Entry point: `main:app`. |
+| `requirements.txt` | ✅ | Python dependencies. |
+| `medical_pdfs/` | ✅ | 11 source PDFs (skin + chest). Chunked into the RAG index at first boot. |
+| `.env.example` | ✅ | Template for required env vars. |
+| `.env` | ❌ **never** | Real secrets. Create on the server only. |
+| `chroma_db/` | ❌ | Persistent vector store, **generated** at first boot. |
+| `chunks.json` | ❌ | Generated chunk dump, regenerated at first boot. |
 
-```bash
-gunicorn hakim_optimized:app \
-  -k uvicorn.workers.UvicornWorker \
-  --workers 1 \
-  --bind 0.0.0.0:8000 \
-  --timeout 120
+`.gitignore` already excludes `.env`, `chroma_db/`, `chunks.json`, logs, and venvs.
+
+---
+
+## 3. Prerequisites
+
+- **Python 3.10+** (developed/tested on 3.13).
+- **OS packages:** `python3-venv`, `build-essential` (some wheels compile native code).
+- **CPU-only is fine.** No GPU required — `torch` runs on CPU. (A GPU works too but isn't needed.)
+- **Outbound internet access (egress).** The service makes outbound HTTPS calls to:
+  | Host | Purpose | Required |
+  |------|---------|----------|
+  | `generativelanguage.googleapis.com` | Gemini model calls | **Yes** (core feature) |
+  | `huggingface.co` / `*.hf.co` | Download the embedding model on first boot | **Yes** (first boot only) |
+  | `eutils.ncbi.nlm.nih.gov` | PubMed evidence lookup | Optional (degrades gracefully if blocked) |
+
+  > If `huggingface.co` is blocked, pre-bake the model into the image / HF cache
+  > (`~/.cache/huggingface`) so first boot doesn't need it.
+
+---
+
+## 4. Configuration (`.env`)
+
+Two variables, both **required** — the app refuses to start if either is missing:
+
+```ini
+GEMINI_API_KEY=...          # Google AI Studio key
+ENDPOINT_API_KEY=...        # secret clients send in the X-API-Key header
 ```
 
-> **عدد الـ workers:** كل worker بيحمّل نسخة من موديل Whisper في الذاكرة (~1–2 GB). زوّد `--workers` على حسب الـ RAM المتاحة فقط. ابدأ بـ `1` وزوّد بحذر.
-> **`--timeout 120`** مهم لأن الـ transcription + Gemini ممكن ياخدوا وقت على الملفات الكبيرة.
+> 🔐 Generate a strong `ENDPOINT_API_KEY` (e.g. `openssl rand -hex 32`). The current dev
+> value must be rotated for production. The Gemini key should also be rotated, as the dev
+> key was shared during development.
 
-أو للتشغيل البسيط بـ uvicorn مباشرة:
-```bash
-uvicorn hakim_optimized:app --host 0.0.0.0 --port 8000 --workers 1
-```
+---
 
-### Reverse proxy (Nginx) — اختياري لكن مُوصى به
-حُط Nginx قدام التطبيق للـ HTTPS ورفع حد حجم الـ upload:
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
+## 5. Resource sizing
 
-    client_max_body_size 50M;   # اسمح بملفات صوتية أكبر
+Each **worker process** loads its own copy of torch + the embedding model into memory.
 
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_read_timeout 120s;
-    }
-}
-```
+- **RAM:** ~1.5–2.5 GB **per worker**. Size the box for `workers × 2 GB` + headroom.
+- **Disk:** ~4 MB (`chroma_db/`) + ~100 MB (HuggingFace model cache) + deps (~few GB incl. torch).
+- **CPU:** embedding + retrieval are light for the current 118-chunk index; the wall-clock time
+  of a request is dominated by the remote Gemini calls, not local CPU.
 
-### تشغيل دائم بـ systemd — اختياري
-ملف `/etc/systemd/system/asr-api.service`:
+---
+
+## 6. Running in production — systemd (recommended, simplest)
+
+`/etc/systemd/system/medvision.service`:
+
 ```ini
 [Unit]
-Description=ASR Medical Report API
+Description=MedVision AI API
 After=network.target
 
 [Service]
-User=www-data
-WorkingDirectory=/opt/asr-api
-EnvironmentFile=/opt/asr-api/.env
-ExecStart=/opt/asr-api/.venv/bin/gunicorn hakim_optimized:app -k uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:8000 --timeout 120
+User=medvision
+WorkingDirectory=/opt/medvision
+EnvironmentFile=/opt/medvision/.env
+# 2 workers ≈ 2 concurrent heavy requests. Increase only if RAM allows (≈2 GB/worker).
+ExecStart=/opt/medvision/.venv/bin/python -m uvicorn main:app \
+          --host 0.0.0.0 --port 8000 --workers 2 --timeout-keep-alive 120
 Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
+
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now asr-api
+sudo systemctl enable --now medvision
+sudo systemctl status medvision
+journalctl -u medvision -f      # logs
 ```
+
+> **Build the index once before scaling.** On a fresh server, start with `--workers 1`
+> the first time so a single process builds `chroma_db/`. Once it logs
+> `✅ Built RAG (...)`, stop and restart with multiple workers — they will all reuse the
+> persisted index (`✅ Loaded persisted RAG (...)`) and skip re-embedding.
 
 ---
 
-## 5) الـ API
+## 7. Running in production — Docker (alternative)
 
-### Endpoint
+`Dockerfile`:
+
+```dockerfile
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+COPY medical_pdfs ./medical_pdfs
+
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2", "--timeout-keep-alive", "120"]
 ```
-POST /transcribe-report
-```
 
-| العنصر | القيمة |
-|--------|--------|
-| Header | `X-API-KEY: <BACKEND_API_KEY>` |
-| Body | `multipart/form-data` بحقل اسمه `file` (ملف صوتي/فيديو) |
-| Response | `200` JSON بالتقرير الطبي / `401` مفتاح غلط / `422` مفيش صوت / `500` خطأ معالجة |
-
-### مثال اختبار
 ```bash
-curl -X POST "http://SERVER:8000/transcribe-report" \
-  -H "X-API-KEY: YOUR_BACKEND_API_KEY" \
-  -F "file=@test.ogg"
+docker build -t medvision:latest .
+docker run -d --name medvision -p 8000:8000 \
+  --env-file .env \
+  -v medvision_chroma:/app/chroma_db \      # persist the index across restarts
+  medvision:latest
 ```
 
-### شكل الـ Response
-```json
-{
-  "diagnosis": "...",
-  "medications": [
-    { "name": "Augmentin", "dose": "...", "frequency": "...", "duration": "...", "notes": "..." }
-  ],
-  "recommendations": ["..."],
-  "follow_up": "..."
+> Mounting a volume at `/app/chroma_db` keeps the built index so containers don't
+> re-embed on every restart. The HuggingFace model cache can likewise be volume-mounted
+> at `/root/.cache/huggingface` to avoid re-downloading the embedding model.
+
+---
+
+## 8. Reverse proxy (nginx) — ⚠️ critical timeouts
+
+**The `/analyze` endpoint takes 40–70 seconds** (two Gemini vision calls, including model
+"thinking" time, plus retrieval). The default nginx `proxy_read_timeout` is **60s**, which
+will cut long requests off with a 504. **You must raise it.**
+
+```nginx
+server {
+    listen 80;
+    server_name medvision.example.com;
+
+    # Images can be up to 15 MB (the app rejects larger with 413)
+    client_max_body_size 20m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # MUST be generous — Gemini calls are slow
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
 }
 ```
 
-### توثيق تفاعلي
-بعد التشغيل: `http://SERVER:8000/docs` (Swagger UI).
+If there's also a cloud load balancer in front, raise **its** idle/read timeout to ≥120s too.
+
+> CORS is handled inside the app (`allow_origins=["*"]`), so nginx does not need CORS rules.
 
 ---
 
-## 6) ملاحظات مهمة للـ DevOps
+## 9. API surface
 
-- **CORS:** حاليًا `allow_origins=["*"]` (مفتوح للكل) في الكود. ضيّقها لدومين الـ frontend بتاعك قبل الإنتاج.
-- **خطأ 503 من Gemini:** الكود فيه retries + موديل احتياطي (`gemini-2.0-flash`). المفتاح المدفوع بيقلّل المشكلة دي جدًا.
-- **الكاش:** خلّي مجلد `~/.cache/huggingface` ثابت (مش بيتمسح مع كل deploy) عشان متعيدش تحميل الموديل. لو Docker، اعمله volume أو حمّل الموديل وقت الـ build.
-- **Health check:** ممكن تستخدم `GET /docs` كـ liveness probe بسيط لحد ما يتعمل endpoint مخصص.
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET`  | `/health` | none | Liveness/readiness probe. Returns `{status, model_chain, rag_ready}`. Use for health checks. |
+| `POST` | `/analyze` | `X-API-Key` header | `multipart/form-data`: `image` (file, ≤15 MB), `patient_name`, `patient_age`. Returns the structured report + RAG sources. |
+
+Health check example for orchestrators:
+
+```bash
+curl -fsS http://localhost:8000/health || exit 1
+```
+
+A request is **ready** to serve traffic only when `/health` returns `"rag_ready": true`
+(the index finished loading). On first boot this can take a minute or two.
 
 ---
 
-## الملفات المرفقة
-- `hakim_optimized.py` — كود التطبيق
-- `requirements.txt` — الـ dependencies بنسخ مثبّتة
-- `.env.example` — قالب المتغيّرات البيئية
+## 10. Operational notes & troubleshooting
+
+- **First boot is slow / makes network calls** — it downloads the embedding model and builds
+  the index. Subsequent boots reuse `chroma_db/` and start in seconds.
+- **Rebuild the index** (e.g. after changing the PDFs in `medical_pdfs/`): delete `chroma_db/`
+  and `chunks.json`, then restart. The app also auto-rebuilds if the chunk count no longer
+  matches the persisted collection.
+- **Occasional `500` from Gemini overload** — the upstream model sometimes returns 503
+  "high demand". The app already waits and retries, then falls through the model chain
+  (`gemini-2.5-flash` → `gemini-2.5-pro` → ...). Transient 500s under heavy load are expected;
+  clients should retry.
+- **PubMed blocked/slow** — handled gracefully: the request still succeeds using local RAG
+  context, just without PubMed sources. Timeouts are short (6s/8s).
+- **Logs** — `journalctl -u medvision -f` (systemd) or `docker logs -f medvision`.
+
+---
+
+## 11. Pre-go-live checklist
+
+- [ ] `.env` created on the server with **rotated** production keys (not the dev values).
+- [ ] `.env` is **not** in version control.
+- [ ] First boot completed with 1 worker; `chroma_db/` built and persisted (volume-mounted under Docker).
+- [ ] `/health` returns `rag_ready: true`.
+- [ ] Reverse proxy `proxy_read_timeout` ≥ 180s and `client_max_body_size` ≥ 20m.
+- [ ] Any cloud LB idle timeout raised to ≥ 120s.
+- [ ] Outbound HTTPS allowed to Google + HuggingFace (and NCBI if PubMed is wanted).
+- [ ] A real `/analyze` call with a valid `X-API-Key` returns `200` end-to-end.
